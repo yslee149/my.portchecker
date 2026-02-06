@@ -13,5 +13,6 @@ struct my_portcheckerApp: App {
         WindowGroup {
             ContentView()
         }
+        .defaultSize(width: 700, height: 500)
     }
 }
