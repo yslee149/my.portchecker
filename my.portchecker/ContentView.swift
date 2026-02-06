@@ -6,6 +6,7 @@
 //
 
 import SwiftUI
+import Network
 
 // MARK: - Model
 
@@ -43,6 +44,55 @@ class PortCheckerViewModel {
     var showKillConfirm = false
     var processToKill: PortProcess?
     var isShowingAllPorts = false
+    var localIPAddress: String = "확인 중..."
+    var ipCopiedToast = false
+
+    // MARK: - IP Address
+
+    func fetchLocalIP() {
+        var addresses: [String] = []
+
+        var ifaddr: UnsafeMutablePointer<ifaddrs>?
+        guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
+            localIPAddress = "알 수 없음"
+            return
+        }
+        defer { freeifaddrs(ifaddr) }
+
+        for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
+            let flags = Int32(ptr.pointee.ifa_flags)
+            let addr = ptr.pointee.ifa_addr.pointee
+
+            // IPv4만, 활성 인터페이스만
+            guard addr.sa_family == UInt8(AF_INET),
+                  (flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING),
+                  (flags & IFF_LOOPBACK) == 0 else { continue }
+
+            var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+            if getnameinfo(
+                ptr.pointee.ifa_addr, socklen_t(addr.sa_len),
+                &hostname, socklen_t(hostname.count),
+                nil, 0, NI_NUMERICHOST
+            ) == 0 {
+                let ip = String(cString: hostname)
+                if !ip.isEmpty {
+                    addresses.append(ip)
+                }
+            }
+        }
+
+        localIPAddress = addresses.first ?? "알 수 없음"
+    }
+
+    func copyIP() {
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(localIPAddress, forType: .string)
+        ipCopiedToast = true
+        Task {
+            try? await Task.sleep(for: .seconds(1.5))
+            ipCopiedToast = false
+        }
+    }
 
     // MARK: - Search
 
@@ -237,6 +287,10 @@ struct ContentView: View {
 
     var body: some View {
         VStack(spacing: 0) {
+            ipBar
+
+            Divider()
+
             searchBar
                 .padding(.horizontal, 20)
                 .padding(.vertical, 14)
@@ -255,6 +309,9 @@ struct ContentView: View {
         }
         .frame(minWidth: 620, minHeight: 420)
         .background(Color(nsColor: .windowBackgroundColor))
+        .onAppear {
+            viewModel.fetchLocalIP()
+        }
         .alert("프로세스 종료 확인", isPresented: $viewModel.showKillConfirm) {
             Button("취소", role: .cancel) { }
             Button("종료", role: .destructive) {
@@ -267,12 +324,12 @@ struct ContentView: View {
         }
     }
 
-    // MARK: - Search Bar
+    // MARK: - IP Bar
 
-    private var searchBar: some View {
-        HStack(spacing: 12) {
+    private var ipBar: some View {
+        HStack(spacing: 8) {
             Image(systemName: "network")
-                .font(.title2)
+                .font(.caption)
                 .foregroundStyle(.blue)
 
             Text("Port Checker")
@@ -280,6 +337,35 @@ struct ContentView: View {
 
             Spacer()
 
+            Text("내 IP")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+
+            Text(viewModel.localIPAddress)
+                .font(.system(.body, design: .monospaced))
+                .fontWeight(.medium)
+                .textSelection(.enabled)
+
+            Button {
+                viewModel.copyIP()
+            } label: {
+                Image(systemName: viewModel.ipCopiedToast ? "checkmark" : "doc.on.doc")
+                    .font(.caption)
+                    .foregroundStyle(viewModel.ipCopiedToast ? .green : .secondary)
+                    .contentTransition(.symbolEffect(.replace))
+            }
+            .buttonStyle(.plain)
+            .help("IP 주소 복사")
+        }
+        .padding(.horizontal, 20)
+        .padding(.vertical, 10)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    // MARK: - Search Bar
+
+    private var searchBar: some View {
+        HStack(spacing: 12) {
             TextField("포트 번호 (1-65535)", text: $viewModel.portNumber)
                 .textFieldStyle(.roundedBorder)
                 .frame(width: 160)
