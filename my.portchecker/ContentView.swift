@@ -45,28 +45,62 @@ class PortCheckerViewModel {
     var processToKill: PortProcess?
     var isShowingAllPorts = false
     var localIPAddress: String = "확인 중..."
+    var networkType: NetworkType = .unknown
     var ipCopiedToast = false
+
+    enum NetworkType {
+        case wifi
+        case ethernet
+        case unknown
+
+        var label: String {
+            switch self {
+            case .wifi: return "Wi-Fi"
+            case .ethernet: return "Ethernet"
+            case .unknown: return ""
+            }
+        }
+
+        var icon: String {
+            switch self {
+            case .wifi: return "wifi"
+            case .ethernet: return "cable.connector.horizontal"
+            case .unknown: return "questionmark.circle"
+            }
+        }
+
+        var color: Color {
+            switch self {
+            case .wifi: return .green
+            case .ethernet: return .blue
+            case .unknown: return .secondary
+            }
+        }
+    }
 
     // MARK: - IP Address
 
     func fetchLocalIP() {
-        var addresses: [String] = []
-
         var ifaddr: UnsafeMutablePointer<ifaddrs>?
         guard getifaddrs(&ifaddr) == 0, let firstAddr = ifaddr else {
             localIPAddress = "알 수 없음"
+            networkType = .unknown
             return
         }
         defer { freeifaddrs(ifaddr) }
+
+        // 인터페이스별 IP 수집: (인터페이스명, IP)
+        var found: [(name: String, ip: String)] = []
 
         for ptr in sequence(first: firstAddr, next: { $0.pointee.ifa_next }) {
             let flags = Int32(ptr.pointee.ifa_flags)
             let addr = ptr.pointee.ifa_addr.pointee
 
-            // IPv4만, 활성 인터페이스만
             guard addr.sa_family == UInt8(AF_INET),
                   (flags & (IFF_UP | IFF_RUNNING)) == (IFF_UP | IFF_RUNNING),
                   (flags & IFF_LOOPBACK) == 0 else { continue }
+
+            let ifName = String(cString: ptr.pointee.ifa_name)
 
             var hostname = [CChar](repeating: 0, count: Int(NI_MAXHOST))
             if getnameinfo(
@@ -76,12 +110,25 @@ class PortCheckerViewModel {
             ) == 0 {
                 let ip = String(cString: hostname)
                 if !ip.isEmpty {
-                    addresses.append(ip)
+                    found.append((name: ifName, ip: ip))
                 }
             }
         }
 
-        localIPAddress = addresses.first ?? "알 수 없음"
+        // en0 = Wi-Fi, en1~enX = Ethernet (macOS 기준)
+        if let entry = found.first(where: { $0.name == "en0" }) {
+            localIPAddress = entry.ip
+            networkType = .wifi
+        } else if let entry = found.first(where: { $0.name.hasPrefix("en") }) {
+            localIPAddress = entry.ip
+            networkType = .ethernet
+        } else if let entry = found.first {
+            localIPAddress = entry.ip
+            networkType = .unknown
+        } else {
+            localIPAddress = "알 수 없음"
+            networkType = .unknown
+        }
     }
 
     func copyIP() {
@@ -337,10 +384,21 @@ struct ContentView: View {
 
             Spacer()
 
-            Text("내 IP")
-                .font(.caption)
-                .foregroundStyle(.secondary)
+            // 네트워크 타입 (Wi-Fi / Ethernet)
+            HStack(spacing: 4) {
+                Image(systemName: viewModel.networkType.icon)
+                    .font(.caption)
+                    .foregroundStyle(viewModel.networkType.color)
+                Text(viewModel.networkType.label)
+                    .font(.caption)
+                    .foregroundStyle(viewModel.networkType.color)
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(viewModel.networkType.color.opacity(0.1))
+            .clipShape(Capsule())
 
+            // IP 주소
             Text(viewModel.localIPAddress)
                 .font(.system(.body, design: .monospaced))
                 .fontWeight(.medium)
