@@ -16,6 +16,20 @@ struct PortProcess: Identifiable, Sendable {
     let user: String
     let type: String
     let name: String
+    let port: Int
+
+    /// lsof NAME 필드에서 포트 번호 추출 (*:8080, 127.0.0.1:3000, [::1]:8080 등)
+    nonisolated static func extractPort(from name: String) -> Int {
+        let cleanName = String(name.split(separator: " ").first ?? Substring(name))
+        // "->" 가 있으면 로컬 쪽(왼쪽)만 사용
+        let localPart = String(cleanName.split(separator: "-").first ?? Substring(cleanName))
+        if let lastColon = localPart.lastIndex(of: ":") {
+            let afterColon = localPart[localPart.index(after: lastColon)...]
+            let portStr = afterColon.prefix(while: { $0.isNumber })
+            return Int(portStr) ?? 0
+        }
+        return 0
+    }
 }
 
 // MARK: - ViewModel
@@ -28,10 +42,12 @@ class PortCheckerViewModel {
     var statusMessage = "포트 번호를 입력하고 검색 버튼을 누르세요."
     var showKillConfirm = false
     var processToKill: PortProcess?
+    var isShowingAllPorts = false
 
     // MARK: - Search
 
     func searchPort() {
+        isShowingAllPorts = false
         let trimmed = portNumber.trimmingCharacters(in: .whitespacesAndNewlines)
         guard let port = Int(trimmed), port > 0, port <= 65535 else {
             statusMessage = "올바른 포트 번호를 입력해주세요 (1-65535)"
@@ -49,7 +65,7 @@ class PortCheckerViewModel {
                 "/usr/sbin/lsof",
                 arguments: ["-i", portArg, "-P", "-n"]
             )
-            let parsed = Self.parseLsofOutput(output)
+            let parsed = Self.parseLsofOutput(output, deduplicateByPID: true)
 
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -58,6 +74,35 @@ class PortCheckerViewModel {
                     self.statusMessage = "포트 \(port)을(를) 사용하는 프로세스가 없습니다."
                 } else {
                     self.statusMessage = "\(parsed.count)개의 프로세스를 찾았습니다."
+                }
+                self.isSearching = false
+            }
+        }
+    }
+
+    // MARK: - Fetch All Ports
+
+    func fetchAllPorts() {
+        isShowingAllPorts = true
+        isSearching = true
+        statusMessage = "사용 중인 포트 검색 중..."
+        processes = []
+
+        Task.detached {
+            let output = Self.runShell(
+                "/usr/sbin/lsof",
+                arguments: ["-iTCP", "-sTCP:LISTEN", "-P", "-n"]
+            )
+            let parsed = Self.parseLsofOutput(output, deduplicateByPID: false)
+                .sorted { $0.port < $1.port }
+
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.processes = parsed
+                if parsed.isEmpty {
+                    self.statusMessage = "사용 중인 포트가 없습니다."
+                } else {
+                    self.statusMessage = "\(parsed.count)개의 포트가 사용 중입니다."
                 }
                 self.isSearching = false
             }
@@ -111,7 +156,11 @@ class PortCheckerViewModel {
     private func refreshAfterDelay() {
         Task {
             try? await Task.sleep(for: .milliseconds(500))
-            searchPort()
+            if isShowingAllPorts {
+                fetchAllPorts()
+            } else {
+                searchPort()
+            }
         }
     }
 
@@ -136,12 +185,16 @@ class PortCheckerViewModel {
         }
     }
 
-    nonisolated private static func parseLsofOutput(_ output: String) -> [PortProcess] {
+    nonisolated private static func parseLsofOutput(
+        _ output: String,
+        deduplicateByPID: Bool = true
+    ) -> [PortProcess] {
         let lines = output.components(separatedBy: "\n").filter { !$0.isEmpty }
         guard lines.count > 1 else { return [] }
 
         var results: [PortProcess] = []
         var seenPIDs = Set<Int32>()
+        var seenPorts = Set<Int>()
 
         for line in lines.dropFirst() {
             let parts = line.split(
@@ -150,16 +203,26 @@ class PortCheckerViewModel {
             guard parts.count >= 9,
                   let pid = Int32(parts[1]) else { continue }
 
-            // PID 중복 제거 (같은 프로세스 여러 FD인 경우)
-            guard !seenPIDs.contains(pid) else { continue }
-            seenPIDs.insert(pid)
+            let name = String(parts[8])
+            let port = PortProcess.extractPort(from: name)
+
+            if deduplicateByPID {
+                // 특정 포트 검색: PID 기준 중복 제거
+                guard !seenPIDs.contains(pid) else { continue }
+                seenPIDs.insert(pid)
+            } else {
+                // 전체 포트 목록: 포트 번호 기준 중복 제거
+                guard !seenPorts.contains(port) else { continue }
+                seenPorts.insert(port)
+            }
 
             results.append(PortProcess(
                 command: String(parts[0]),
                 pid: pid,
                 user: String(parts[2]),
                 type: String(parts[4]),
-                name: String(parts[8])
+                name: name,
+                port: port
             ))
         }
 
@@ -232,6 +295,17 @@ struct ContentView: View {
             .buttonStyle(.borderedProminent)
             .disabled(viewModel.isSearching || viewModel.portNumber.isEmpty)
 
+            Divider()
+                .frame(height: 20)
+
+            Button {
+                viewModel.fetchAllPorts()
+            } label: {
+                Label("사용 중인 포트", systemImage: "list.bullet.rectangle")
+            }
+            .buttonStyle(.bordered)
+            .disabled(viewModel.isSearching)
+
             if viewModel.isSearching {
                 ProgressView()
                     .controlSize(.small)
@@ -264,6 +338,10 @@ struct ContentView: View {
         VStack(spacing: 0) {
             // 테이블 헤더
             HStack(spacing: 0) {
+                if viewModel.isShowingAllPorts {
+                    Text("포트")
+                        .frame(width: 70, alignment: .leading)
+                }
                 Text("프로세스")
                     .frame(width: 110, alignment: .leading)
                 Text("PID")
@@ -299,6 +377,14 @@ struct ContentView: View {
 
     private func processRow(_ process: PortProcess) -> some View {
         HStack(spacing: 0) {
+            if viewModel.isShowingAllPorts {
+                Text("\(process.port)")
+                    .font(.system(.body, design: .monospaced))
+                    .fontWeight(.semibold)
+                    .foregroundStyle(.orange)
+                    .frame(width: 70, alignment: .leading)
+            }
+
             HStack(spacing: 6) {
                 Image(systemName: "app.fill")
                     .foregroundStyle(.blue)
